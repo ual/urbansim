@@ -14,11 +14,11 @@ with open('README.rst', 'r') as f:
 
 setup(
     name='urbansim',
-    version='1.4dev',
+    version='3.1dev',
     description='Tool for modeling metropolitan real estate markets',
     long_description=long_description,
-    author='Autodesk',
-    author_email='udst@autodesk.com',
+    author='UrbanSim Inc.',
+    author_email='info@urbansim.com',
     license='BSD',
     url='https://github.com/udst/urbansim',
     classifiers=[

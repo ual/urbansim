@@ -181,7 +181,7 @@ class SqFtProFormaConfig(object):
             'underground': 110
         }
 
-        self.height_per_story = 10.0
+        self.height_per_story = 12.0
         self.max_retail_height = 2.0
         self.max_industrial_height = 2.0
 
@@ -336,20 +336,9 @@ class SqFtProForma(object):
                 # need to converge in on exactly how much far is available for
                 # deck pkg
                 if parking_config == 'deck':
-                    orig_bulk = building_bulk
-                    while 1:
-                        parkingstalls = building_bulk * \
-                            np.sum(uses_distrib * c.parking_rates) / \
-                            c.sqft_per_rate
-                        if np.where(
-                                np.absolute(
-                                    orig_bulk - building_bulk -
-                                    parkingstalls *
-                                    c.parking_sqft_d[parking_config]) > 10.0
-                                )[0].size == 0:
-                            break
-                        building_bulk = orig_bulk - parkingstalls * \
-                            c.parking_sqft_d[parking_config]
+                    building_bulk /= (1.0 + np.sum(uses_distrib * c.parking_rates) *
+                                      c.parking_sqft_d[parking_config] /
+                                      c.sqft_per_rate)
 
                 df['building_sqft'] = building_bulk
 
@@ -375,46 +364,34 @@ class SqFtProForma(object):
                     stories = building_bulk / \
                         (c.tiled_parcel_sizes - parkingstalls *
                          c.parking_sqft_d[parking_config])
-                    df['park_sqft'] = parkingstalls * \
-                        c.parking_sqft_d[parking_config]
+                    df['park_sqft'] = 0
                     # not all fars support surface parking
-                    stories[np.where(stories < 0.0)] = np.nan
+                    stories[stories < 0.0] = np.nan
+                    # I think we can assume that stories over 3
+                    # do not work with surface parking
+                    stories[stories > 5.0] = np.nan
 
-                df['total_sqft'] = df.building_sqft + df.park_sqft
+                df['total_built_sqft'] = df.building_sqft + df.park_sqft
+                df['parking_sqft_ratio'] = df.park_sqft / df.total_built_sqft
                 stories /= c.parcel_coverage
                 df['stories'] = np.ceil(stories)
+                df['height'] = df.stories * c.height_per_story
                 df['build_cost_sqft'] = self._building_cost(uses_distrib, stories)
 
                 df['build_cost'] = df.build_cost_sqft * df.building_sqft
                 df['park_cost'] = parking_cost
                 df['cost'] = df.build_cost + df.park_cost
 
-                df['ave_cost_sqft'] = (df.cost / df.total_sqft) * c.profit_factor
+                df['ave_cost_sqft'] = (df.cost / df.total_built_sqft) * c.profit_factor
 
                 if name == 'retail':
                     df['ave_cost_sqft'][c.fars > c.max_retail_height] = np.nan
                 if name == 'industrial':
                     df['ave_cost_sqft'][c.fars > c.max_industrial_height] = np.nan
+
                 df_d[(name, parking_config)] = df
 
-        # from here on out we need the min rent for a form and a far
-        min_ave_cost_sqft_d = {}
-        bignum = 999999
-
-        for name in keys:
-            min_ave_cost_sqft = None
-            for parking_config in c.parking_configs:
-                ave_cost_sqft = df_d[(name, parking_config)][
-                    'ave_cost_sqft'].fillna(bignum)
-                min_ave_cost_sqft = ave_cost_sqft if min_ave_cost_sqft is None \
-                    else np.minimum(min_ave_cost_sqft, ave_cost_sqft)
-
-            min_ave_cost_sqft = min_ave_cost_sqft.replace(bignum, np.nan)
-            # this is the minimum cost per sqft for this form and far
-            min_ave_cost_sqft_d[name] = min_ave_cost_sqft
-
         self.dev_d = df_d
-        self.min_ave_cost_d = min_ave_cost_sqft_d
 
     def get_debug_info(self, form, parking_config):
         """
@@ -439,25 +416,24 @@ class SqFtProForma(object):
         """
         return self.dev_d[(form, parking_config)]
 
-    def get_ave_cost_sqft(self, form):
+    def get_ave_cost_sqft(self, form, parking_config):
         """
         Get the average cost per sqft for the pro forma for a given form
-
         Parameters
         ----------
         form : string
             Get a series representing the average cost per sqft for each form in
             the config
-
+        parking_config : string
+            The parking configuration to get debug info for
         Returns
         -------
         cost : series
             A series where the index is the far and the values are the average
             cost per sqft at which the building is "break even" given the
             configuration parameters that were passed at run time.
-
         """
-        return self.min_ave_cost_d[form]
+        return self.dev_d[(form, parking_config)].ave_cost_sqft
 
     def lookup(self, form, df, only_built=True, pass_through=None):
         """
@@ -536,14 +512,53 @@ class SqFtProForma(object):
             and max_height from the input dataframe).
 
         """
+        c = self.config
+        d = {}
+        profit_df = pd.DataFrame()
+        for parking_config in c.parking_configs:
+            # this function gives the max profit development for the given
+            # parking config need to iterate over parking configs to pick the
+            # max profit config
+            outdf = self._lookup_parking_cfg(form, parking_config, df, only_built,
+                                             pass_through)
+            d[parking_config] = outdf
+            profit_df[parking_config] = outdf["max_profit"]
+
+        # get the max_profit idx
+        max_profit_ind = profit_df.idxmax(axis=1)
+
+        if len(max_profit_ind) == 0:
+            return pd.DataFrame()
+
+        # make a new df of all the attributes from the max profit df
+        l = []
+        for parking_config in c.parking_configs:
+            s = max_profit_ind[max_profit_ind == parking_config]
+            # these are the rows that are most profitable with this
+            # parking config
+            tmpdf = d[parking_config].loc[s.index]
+            tmpdf["parking_config"] = parking_config
+            l.append(tmpdf)
+
+        df = pd.concat(l)
+
+        return df
+
+    def _lookup_parking_cfg(self, form, parking_config, df, only_built=True,
+                            pass_through=None):
+
+        dev_info = self.dev_d[(form, parking_config)]
+
+        cost_sqft_col = np.reshape(dev_info.ave_cost_sqft.values, (-1, 1))
+        cost_sqft_index_col = np.reshape(dev_info.index.values, (-1, 1))
+
+        parking_sqft_ratio = np.reshape(dev_info.parking_sqft_ratio.values, (-1, 1))
+        heights = np.reshape(dev_info.height.values, (-1, 1))
+
         # don't really mean to edit the df that's passed in
         df = df.copy()
 
         c = self.config
-
-        cost_sqft = self.get_ave_cost_sqft(form)
-        cost_sqft_col = np.reshape(cost_sqft.values, (-1, 1))
-        cost_sqft_index_col = np.reshape(cost_sqft.index.values, (-1, 1))
 
         # weighted rent for this form
         df['weighted_rent'] = np.dot(df[c.uses], c.forms[form])
@@ -581,11 +596,18 @@ class SqFtProForma(object):
         if only_built:
             df = df.query('min_max_fars > 0 and parcel_size > 0')
 
-        # all possible fars on all parcels
         fars = np.repeat(cost_sqft_index_col, len(df.index), axis=1)
 
-        # zero out fars not allowed by zoning
+        # turn fars into nans which are not allowed by zoning
+        # (so we can fillna with one of the other zoning constraints)
         fars[fars > df.min_max_fars.values + .01] = np.nan
+
+        # same thing for heights
+        heights = np.repeat(heights, len(df.index), axis=1)
+
+        # turn heights into nans which are not allowed by zoning
+        # (so we can fillna with one of the other zoning constraints)
+        fars[heights > df.max_height.values + .01] = np.nan
 
         # parcel sizes * possible fars
         building_bulks = fars * df.parcel_size.values
@@ -597,8 +619,8 @@ class SqFtProForma(object):
         total_costs = building_costs + df.land_cost.values
 
         # rent to make for the new building
-        building_revenue = building_bulks * c.building_efficiency *\
-            df.weighted_rent.values / c.cap_rate
+        building_revenue = building_bulks * (1-parking_sqft_ratio) * \
+            c.building_efficiency * df.weighted_rent.values / c.cap_rate
 
         # profit for each form
         profit = building_revenue - total_costs
@@ -613,6 +635,8 @@ class SqFtProForma(object):
         outdf = pd.DataFrame({
             'building_sqft': twod_get(maxprofitind, building_bulks),
             'building_cost': twod_get(maxprofitind, building_costs),
+            'parking_ratio': parking_sqft_ratio[maxprofitind].flatten(),
+            'stories': twod_get(maxprofitind, heights) / c.height_per_story,
             'total_cost': twod_get(maxprofitind, total_costs),
             'building_revenue': twod_get(maxprofitind, building_revenue),
             'max_profit_far': twod_get(maxprofitind, fars),
@@ -622,14 +646,15 @@ class SqFtProForma(object):
         if pass_through:
             outdf[pass_through] = df[pass_through]
 
-        if only_built:
-            outdf = outdf.query('max_profit > 0').copy()
-
         resratio = c.res_ratios[form]
         nonresratio = 1.0 - resratio
         outdf["residential_sqft"] = outdf.building_sqft * c.building_efficiency * resratio
-        outdf["non_residential_sqft"] = outdf.building_sqft * nonresratio
-        outdf["stories"] = outdf["max_profit_far"] / c.parcel_coverage
+        outdf["non_residential_sqft"] = outdf.building_sqft * c.building_efficiency * nonresratio
+
+        if only_built:
+            outdf = outdf.query('max_profit > 0').copy()
+        else:
+            outdf = outdf.loc[outdf.max_profit != -np.inf].copy()
 
         return outdf
 
@@ -652,7 +677,7 @@ class SqFtProForma(object):
             logger.debug(df_d[key])
         for form in self.config.forms:
             logger.debug("\n" + str(key) + "\n")
-            logger.debug(self.get_ave_cost_sqft(form))
+            logger.debug(self.get_ave_cost_sqft(form, "surface"))
 
         keys = c.forms.keys()
         keys.sort()
