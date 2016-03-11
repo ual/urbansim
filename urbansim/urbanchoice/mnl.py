@@ -172,7 +172,7 @@ def mnl_simulate(data, coeff, numalts, GPU=False, returnprobs=True):
     return choices.get_mat()
 
 
-def mnl_estimate(data, chosen, numalts, GPU=False, coeffrange=(-3, 3),
+def mnl_estimate(data, chosen, numalts, GPU=False, coeffrange=(-10, 10),
                  weights=None, lcgrad=False, beta=None):
     """
     Calculate coefficients of the MNL model.
