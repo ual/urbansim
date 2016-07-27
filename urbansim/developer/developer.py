@@ -98,7 +98,8 @@ class Developer(object):
 
     def pick(self, form, target_units, parcel_size, ave_unit_size,
              current_units, max_parcel_size=200000, min_unit_size=400,
-             drop_after_build=True, residential=True, bldg_sqft_per_job=400.0):
+             drop_after_build=True, residential=True, bldg_sqft_per_job=400.0,
+             profit_to_prob_func=None):
         """
         Choose the buildings from the list that are feasible to build in
         order to match the specified demand.
@@ -142,17 +143,24 @@ class Developer(object):
         residential: bool
             If creating non-residential buildings set this to false and
             developer will fill in job_spaces rather than residential_units
+        profit_to_prob_func: function
+            As there are so many ways to turn the development feasibility
+            into a probability to select it for building, the user may pass
+            a function which takes the feasibility dataframe and returns
+            a series of probabilities.  If no function is passed, the behavior
+            of this method will not change
 
         Returns
         -------
+        None if thar are no feasible buildings
         new_buildings : dataframe
             DataFrame of buildings to add.  These buildings are rows from the
             DataFrame that is returned from feasibility.
         """
 
         if len(self.feasibility) == 0:
-            # no feasible buldings, might as well bail
-            return None
+            # no feasible buildings, might as well bail
+            return
 
         if form is None:
             df = self.feasibility
@@ -185,23 +193,28 @@ class Developer(object):
         # print "Describe of net units\n", df.net_units.describe()
         print "Sum of net units that are profitable: {:,}".\
             format(int(df.net_units.sum()))
+
+        if profit_to_prob_func:
+            p = profit_to_prob_func(df)
+        else:
+            df['max_profit_per_size'] = df.max_profit / df.parcel_size
+            p = df.max_profit_per_size.values / df.max_profit_per_size.sum()
+
         if df.net_units.sum() < target_units:
             print "WARNING THERE WERE NOT ENOUGH PROFITABLE UNITS TO " \
                   "MATCH DEMAND"
-
-        df['max_profit_per_size'] = df.max_profit / df.parcel_size
-
-        choices = np.random.choice(df.index.values, size=len(df.index),
-                                   replace=False,
-                                   p=(df.max_profit_per_size.values /
-                                      df.max_profit_per_size.sum()))
-        net_units = df.net_units.loc[choices]
-        tot_units = net_units.values.cumsum()
-        ind = int(np.searchsorted(tot_units, target_units, side="left"))
-        if target_units != 0:
-            ind += 1
-        ind = min(ind, len(choices))
-        build_idx = choices[:ind]
+            build_idx = df.index.values
+        elif target_units <= 0:
+            build_idx = []
+        else:
+            # we don't know how many developments we will need, as they differ in net_units.
+            # If all developments have net_units of 1 than we need target_units of them.
+            # So we choose the smaller of available developments and target_units.
+            choices = np.random.choice(df.index.values, size=min(len(df.index), target_units),
+                                       replace=False, p=p)
+            tot_units = df.net_units.loc[choices].values.cumsum()
+            ind = int(np.searchsorted(tot_units, target_units, side="left")) + 1
+            build_idx = choices[:ind]
 
         if drop_after_build:
             self.feasibility = self.feasibility.drop(build_idx)
@@ -211,7 +224,7 @@ class Developer(object):
         return new_df.reset_index()
 
     @staticmethod
-    def merge(old_df, new_df):
+    def merge(old_df, new_df, return_index=False):
         """
         Merge two dataframes of buildings.  The old dataframe is
         usually the buildings dataset and the new dataframe is a modified
@@ -223,15 +236,27 @@ class Developer(object):
             Current set of buildings
         new_df : dataframe
             New buildings to add, usually comes from this module
+        return_index : bool
+            If return_index is true, this method will return the new
+            index of new_df (which changes in order to create a unique
+            index after the merge)
 
         Returns
         -------
         df : dataframe
             Combined DataFrame of buildings, makes sure indexes don't overlap
+        index : pd.Index
+            If and only if return_index is True, return the new index for the
+            new_df dataframe (which changes in order to create a unique index
+            after the merge)
         """
         maxind = np.max(old_df.index.values)
         new_df = new_df.reset_index(drop=True)
         new_df.index = new_df.index + maxind + 1
         concat_df = pd.concat([old_df, new_df], verify_integrity=True)
         concat_df.index.name = 'building_id'
+
+        if return_index:
+            return concat_df, new_df.index
+
         return concat_df
